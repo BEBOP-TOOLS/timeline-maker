@@ -226,6 +226,16 @@ body.client #board [data-p]{cursor:default}
 .dots-nav button{width:7px;height:7px;padding:0;border-radius:50%;border:1px solid var(--ink);background:transparent;opacity:.5;text-decoration:none}
 .dots-nav button.on{background:var(--ink);opacity:1}
 @media (prefers-reduced-motion:reduce){.scene,.fi,.lbl,.pick{transition:none}}
+
+/* ---- team login ---- */
+#gate{position:fixed;inset:0;z-index:100;background:var(--page);display:grid;place-items:center}
+#gate[hidden]{display:none}
+#gate .gate-box{display:flex;flex-direction:column;align-items:stretch;gap:18px;text-align:center;width:260px}
+#gate .wordmark{position:static;width:260px;height:calc(260px*134/505);margin:0}
+#gate .gate-sub{margin:-4px 0 22px;color:var(--sub);font-size:13px}
+#gate button{height:42px;border:0;border-radius:10px;background:var(--ink);color:var(--page);font:inherit;font-size:13px;text-decoration:none;cursor:pointer}
+#gate .gate-msg{min-height:1.4em;margin:0;font-size:12px;color:var(--sub)}
+#gate .gate-msg.err{color:var(--danger)}
 </style>
 </head>
 <body>
@@ -258,12 +268,19 @@ body.client #board [data-p]{cursor:default}
 </div>
 <nav class="dots-nav" id="dots" aria-label="scenes"></nav>
 <div class="toast" id="toast"></div>
+<div id="gate" hidden><div class="gate-box">
+  <div class="wordmark" role="img" aria-label="BEBOP."></div>
+  <p class="gate-sub">timeline maker</p>
+  <button id="bLogin">sign in @bebop.kr</button>
+  <p class="gate-msg" id="gateMsg"></p>
+</div></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
 (function(){
 const APP_SRC=document.currentScript?document.currentScript.textContent:'';
-const SKEL=(()=>{const c=document.body.cloneNode(true);c.querySelectorAll('script').forEach(s=>s.remove());return c.innerHTML})();
+const SKEL=(()=>{const c=document.body.cloneNode(true);c.querySelectorAll('script,#gate').forEach(s=>s.remove());return c.innerHTML})();
 const CLIENT=window.__TL_CLIENT__||null;
-let VIEW=!!CLIENT,VIEWER_ID=null,VIEW_EMPTY=false;
+let VIEW=!!CLIENT,VIEW_EMPTY=false;
 if(CLIENT)document.body.classList.add('client');
 const W=1920,H=1080;
 const DOW=['일','월','화','수','목','금','토'];
@@ -785,12 +802,40 @@ function hideTip(){tip.classList.remove('on')}
 /* ---------- export ---------- */
 const toastEl=document.getElementById('toast');let toastT;
 function toast(m){toastEl.textContent=m;toastEl.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>toastEl.classList.remove('on'),2400)}
-let dlCap=null,dlReady=false;
-const dlP=(!CLIENT&&window.claude&&typeof window.claude.use==='function')?window.claude.use('downloads').then(d=>{dlCap=d;dlReady=true;return d}).catch(()=>{dlReady=true;return null}):Promise.resolve(null).then(()=>{dlReady=true;return null});
 
-/* ---------- archive (shared db, local fallback) + client page ---------- */
+/* ---------- team cloud (Supabase) ---------- */
+// served over http(s): Google login limited to @bebop.kr, archive in table 'timelines' (setup: supabase/setup.sql).
+// opened as a file → local archive only
+const SB_URL='https://bvqfcrkpajvwcjeibscr.supabase.co',SB_KEY='sb_publishable_sasYVpFJghEgztQuCD4OwQ_RlmQj65V',DOMAIN='bebop.kr';
+const cloud={sb:null,user:null};
+const okMail=e=>(e||'').toLowerCase().endsWith('@'+DOMAIN);
+async function cloudInit(){
+  if(CLIENT||!/^https?:$/.test(location.protocol)||!window.supabase)return;
+  cloud.sb=supabase.createClient(SB_URL,SB_KEY);
+  const{data:{session}}=await cloud.sb.auth.getSession();
+  if(location.hash.includes('access_token')||location.search.includes('code='))history.replaceState(null,'',location.pathname);
+  const u=session&&session.user;
+  if(u&&okMail(u.email)){cloud.user=u;return}
+  if(u)await cloud.sb.auth.signOut();
+  await gate(u?`${u.email} can't be used — sign in with an @${DOMAIN} account`:'');
+}
+// login screen: stays up until the Google redirect brings the user back
+function gate(err){
+  document.getElementById('gate').hidden=false;
+  const m=document.getElementById('gateMsg');if(err){m.textContent=err;m.classList.add('err')}
+  document.getElementById('bLogin').onclick=()=>cloud.sb.auth.signInWithOAuth({provider:'google',options:{
+    redirectTo:location.origin+location.pathname,queryParams:{hd:DOMAIN,prompt:'select_account'}}});
+  return new Promise(()=>{});
+}
+const rowOf=(id,r)=>({id,client:r.client,project:r.project,start_date:r.start,end_date:r.end,backup:r.backup,weeks:r.weeks,phases:r.phases,updated:r.updated,state:r.state,saved_by:cloud.user.email});
+const recOf=x=>({id:x.id,client:x.client,project:x.project,start:x.start_date,end:x.end_date,backup:x.backup,weeks:+x.weeks,phases:x.phases,updated:+x.updated,state:x.state,by:x.saved_by});
+async function cloudList(){const{data,error}=await cloud.sb.from('timelines').select('*').order('updated',{ascending:false}).limit(300);if(error)throw error;return data.map(recOf)}
+async function cloudPut(id,r){const{error}=await cloud.sb.from('timelines').upsert(rowOf(id,r));if(error)throw error}
+async function cloudDel(id){const{error}=await cloud.sb.from('timelines').delete().eq('id',id);if(error)throw error}
+
+/* ---------- archive (team cloud, local fallback) + client page ---------- */
 const archEl=document.getElementById('arch'),saveSt=document.getElementById('saveSt');
-let DB=null,ARCH=[],ARCH_SRC='local',LAST_SAVED='';
+let ARCH=[],LAST_SAVED='';
 const MON=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 function localArch(){try{return JSON.parse(localStorage.getItem('tlmaker.archive')||'[]')}catch(e){return[]}}
 function setLocalArch(a){try{localStorage.setItem('tlmaker.archive',JSON.stringify(a))}catch(e){}}
@@ -806,7 +851,7 @@ async function saveRecord(silent){
   const rec=recordOf();const sig=rec.state;
   if(silent&&sig===LAST_SAVED)return;
   try{
-    if(DB)await DB.collection('projects').doc(S.id).set(rec);
+    if(cloud.user){await cloudPut(S.id,rec);ARCH=[Object.assign({id:S.id},rec)].concat(ARCH.filter(x=>x.id!==S.id));renderArchive()}
     else{const a=localArch().filter(x=>x.id!==S.id);a.unshift(Object.assign({id:S.id},rec));setLocalArch(a);ARCH=a;renderArchive()}
     LAST_SAVED=sig;try{localStorage.setItem('tlmaker.v2',JSON.stringify(S))}catch(e){}
     const t=new Date();saveSt.textContent=`saved ${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`;
@@ -840,8 +885,6 @@ async function shareRecord(r){
   let st;try{st=JSON.parse(r.state)}catch(e){toast('could not read this record');return}
   const html=clientHTML(st);
   const fn=(((r.client||'client')+'_'+(r.project||'project')).replace(/[\\/:*?"<>|\s]+/g,'_'))+'_schedule.html';
-  const cap=dlReady?dlCap:await Promise.race([dlP,new Promise(res=>setTimeout(()=>res(null),1500))]);
-  if(cap){try{await cap.save({filename:fn,data:html});toast('client page saved');return}catch(err){const c=err&&err.code;if(c==='declined'){toast('save cancelled');return}if(c==='rate_limited'){toast('try again in a moment');return}}}
   const u=URL.createObjectURL(new Blob([html],{type:'text/html'}));const a=document.createElement('a');a.href=u;a.download=fn;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),3000);
 }
 if(archEl)archEl.addEventListener('click',async e=>{
@@ -850,23 +893,21 @@ if(archEl)archEl.addEventListener('click',async e=>{
   if(act==='new'){if(!arm(b,'click again to start new'))return;S=defaults();S.mig2=1;SEL=null;LAST_SAVED='';saveSt.textContent='';persist();renderSetup();renderAll();renderArchive();goScene(1);toast('new project started')}
   else if(act==='open'&&r){try{S=JSON.parse(r.state);S.id=r.id;LAST_SAVED=r.state;SEL=null;persist();renderSetup();renderAll();renderArchive();goScene(1)}catch(err){toast('could not open this record')}}
   else if(act==='share'&&r)shareRecord(r);
-  else if(act==='viewer'&&r)setViewerProject(r);
   else if(act==='del'&&r){if(!arm(b,'delete?'))return;
-    try{if(DB)await DB.collection('projects').doc(r.id).delete();else{const a=localArch().filter(x=>x.id!==r.id);setLocalArch(a);ARCH=a;renderArchive()}if(S.id===r.id){delete S.id;persist()}}catch(err){toast('could not delete')}}
+    try{if(cloud.user){await cloudDel(r.id);ARCH=ARCH.filter(x=>x.id!==r.id);renderArchive()}else{const a=localArch().filter(x=>x.id!==r.id);setLocalArch(a);ARCH=a;renderArchive()}if(S.id===r.id){delete S.id;persist()}}catch(err){toast('could not delete')}}
 });
 if(archEl)archEl.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.classList.contains('arow'))e.target.click()});
 function arm(btn,label){if(btn.dataset.armed){delete btn.dataset.armed;return true}btn.dataset.armed='1';const old=btn.textContent;btn.textContent=label;setTimeout(()=>{if(btn.isConnected&&btn.dataset.armed){delete btn.dataset.armed;btn.textContent=old}},3000);return false}
+async function refreshArchive(){if(!cloud.user)return;try{ARCH=await cloudList();renderArchive()}catch(err){toast('could not load the archive')}}
 async function initArchive(){
   if(VIEW)return;
   ARCH=localArch();renderArchive();
-  if(!(window.claude&&typeof window.claude.use==='function'))return;
-  let db=null;try{db=await window.claude.use('db')}catch(e){db=null}
-  if(!db)return;
-  DB=db;ARCH_SRC='db';
-  DB.doc('config/viewer').onSnapshot(s=>{const d=s.data&&s.data();VIEWER_ID=d&&d.projectId||null;renderArchive();const t=document.getElementById('viewerTog');if(t)t.checked=!!(S.id&&S.id===VIEWER_ID)},()=>{});
-  DB.collection('projects').orderBy('updated','desc').limit(300).onSnapshot(snap=>{ARCH=snap.docs.map(d=>Object.assign({id:d.id},d.data()));renderArchive()},err=>{DB=null;ARCH_SRC='local';ARCH=localArch();renderArchive()});
+  await cloudInit();
+  if(!cloud.user)return;
+  ARCH=[];renderArchive();await refreshArchive();
 }
 initArchive();
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshArchive()});
 
 /* share file (kor / eng) */
 const shareBox=document.getElementById('shareBox');
@@ -881,16 +922,6 @@ shareBox.addEventListener('click',async e=>{
   shareRecord({client:S.client,project:S.project,state:JSON.stringify(st)});
 });
 document.addEventListener('pointerdown',e=>{if(!shareBox.contains(e.target)&&shareBox.querySelector('.half'))shareIdle()},true);
-/* viewer page toggle */
-side.addEventListener('change',async e=>{
-  if(e.target.id!=='viewerTog')return;
-  const on=e.target.checked;
-  if(!DB){e.target.checked=false;toast('viewer sharing needs the shared archive');return}
-  try{
-    if(on){await saveRecord(true);await DB.doc('config/viewer').set({projectId:S.id,updated:Date.now()});toast('viewer page set')}
-    else{await DB.doc('config/viewer').set({projectId:null,updated:Date.now()});toast('viewer page off')}
-  }catch(err){e.target.checked=!on;toast('could not save viewer setting')}
-});
 /* marker text draft → solid */
 side.addEventListener('input',e=>{const k=e.target.dataset.mk;if(k!=null&&S.markers[+k]){S.markers[+k].draft=false;e.target.classList.remove('draft')}});
 side.addEventListener('focusout',e=>{const k=e.target.dataset.mk;if(k!=null&&S.markers[+k]&&S.markers[+k].draft){S.markers[+k].draft=false;e.target.classList.remove('draft');persist()}});
@@ -1108,7 +1139,7 @@ function onScroll(){
   nameEl.classList.toggle('on',k===1||k===2);nameEl.classList.toggle('up',k>2);
   lblSched.classList.toggle('on',k===1||k===2);
   [...dotsEl.children].forEach((b,j)=>b.classList.toggle('on',j===k));
-  if(k===3)renderPreview();else if(k===1||k===2)renderSetup();else if(k===5)renderArchive();
+  if(k===3)renderPreview();else if(k===1||k===2)renderSetup();else if(k===5){renderArchive();refreshArchive()}
 }
 window.addEventListener('scroll',onScroll,{passive:true});window.addEventListener('resize',()=>{CUR=-1;onScroll()});
 dotsEl.addEventListener('click',e=>{const b=e.target.closest('[data-go]');if(b)goScene(+b.dataset.go)});
@@ -1118,48 +1149,6 @@ function goTimeline(){
 }
 function setView(v){renderSetup();if(v==='setup')goScene(0)}
 
-/* ---------- viewer mode (no edit rights → read-only, scenes 1–4 only) ---------- */
-let unProj=null;
-function enterViewer(state,opts){
-  VIEW=true;document.body.classList.add('client');closePick();
-  if(state){S=state;delete S.id;SEL=null;renderSetup();renderAll()}
-  setupScenes();if(!(opts&&opts.keepScene))goScene(0);else onScroll();
-}
-function viewerEmpty(msg){VIEW_EMPTY=true;const sh=document.querySelector('.scrollhint');if(sh)sh.textContent=msg}
-async function initRole(){
-  if(CLIENT||!(window.claude&&typeof window.claude.use==='function'))return;
-  let u=null;try{u=await window.claude.use('user')}catch(e){}
-  let editor=true;if(u){try{editor=await u.canEdit()}catch(e){editor=true}}
-  if(editor||PREVIEW)return;
-  enterViewer(null);
-  let db=null;try{db=await window.claude.use('db')}catch(e){}
-  if(!db){viewerEmpty('this schedule is not available here');return}
-  followViewer(db);
-}
-function followViewer(db){
-  let first=true;
-  db.doc('config/viewer').onSnapshot(snap=>{
-    const d=snap.data&&snap.data();const pid=d&&d.projectId;
-    if(unProj){unProj();unProj=null}
-    if(!pid){viewerEmpty('no schedule has been shared yet');return}
-    unProj=db.collection('projects').doc(pid).onSnapshot(ps=>{
-      const r=ps.data&&ps.data();if(!r){viewerEmpty('no schedule has been shared yet');return}
-      try{enterViewer(JSON.parse(r.state),{keepScene:!first});first=false}catch(e){}
-    },()=>{});
-  },()=>viewerEmpty('this schedule is not available here'));
-}
-let PREVIEW=false;
-async function setViewerProject(r){
-  if(!DB){toast('viewer sharing needs the shared archive');return}
-  try{await DB.doc('config/viewer').set({projectId:r.id,updated:Date.now()});toast('viewer page set')}catch(e){toast('could not save viewer setting')}
-}
-function previewViewer(){
-  if(!DB){toast('viewer preview needs the shared archive');return}
-  const r=ARCH.find(x=>x.id===VIEWER_ID);if(!r){toast('choose a viewer project first');return}
-  PREVIEW=true;const bar=document.createElement('button');bar.className='exitpv';bar.textContent='exit viewer preview';bar.onclick=()=>location.reload();document.body.appendChild(bar);
-  try{enterViewer(JSON.parse(r.state))}catch(e){}
-}
-initRole();
 requestAnimationFrame(onScroll);
 
 renderAll();
@@ -1169,5 +1158,3 @@ if(document.fonts&&document.fonts.load){Promise.all([document.fonts.load('300 16
 </script>
 </body>
 </html>
-
-</body></html>
